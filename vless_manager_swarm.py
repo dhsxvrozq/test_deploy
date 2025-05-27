@@ -7,6 +7,7 @@ import uuid
 import random
 import json
 import subprocess
+import urllib.request
 from pathlib import Path
 
 # -------------------------------------------------------------------
@@ -144,6 +145,20 @@ def create_config_object(username: str, uuid_str: str, private_key: str, short_i
     }
 
 
+def get_external_ip() -> str:
+    """
+    Определяет внешний публичный IP сервера через сервис api.ipify.org.
+    Возвращает строку с IP или пустую строку при ошибке.
+    """
+    try:
+        with urllib.request.urlopen("https://api.ipify.org") as response:
+            ip = response.read().decode('utf-8').strip()
+            return ip
+    except Exception as e:
+        print(f"⚠️ Не удалось определить внешний IP: {e}")
+        return ""
+
+
 def create_service(username: str, port: int, target_node: str | None = None) -> None:
     """
     В Docker Swarm создаёт сервис vless-<username>:
@@ -196,13 +211,7 @@ def remove_user(username: str) -> None:
     # 2) Удаляем Docker config (игнорируем ошибку, если его нет)
     subprocess.run(["docker", "config", "rm", config_name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-    # 3) Освобождаем порт: 
-    #    Читая USED_PORTS_FILE, удаляем порт, который был выделен этому пользователю.
-    #    Предполагаем, что мы где-то хранили port → username. 
-    #    В этой упрощённой версии мы не храним маппинг, 
-    #    поэтому просто очищаем последнюю строку (не рекомедуем в продакшне). 
-    #    Лучше завести отдельный файл user→portMapping либо хранить порт в Docker-сервисе как метку.
-    #    Ниже — максимально простая логика: искать метку "vless-port=<port>" у сервиса.
+    # 3) Освобождаем порт:
     try:
         inspect = subprocess.run(
             ["docker", "service", "inspect", service_name,
@@ -213,9 +222,6 @@ def remove_user(username: str) -> None:
         if labels and "vless-port" in labels:
             port_to_release = int(labels["vless-port"])
             release_port(port_to_release)
-        else:
-            # Ничего не нашли — пропускаем
-            pass
     except Exception:
         pass
 
@@ -330,8 +336,12 @@ if __name__ == "__main__":
             release_port(port)
             sys.exit(1)
 
-        # 5) Собираем VLESS-ссылку для клиента
-        ip_or_domain = "<ВАШ_СТАТИЧНЫЙ_IP_ИЛИ_ДОМЕН>"
+        # 5) Собираем VLESS-ссылку для клиента с автоматическим определением IP
+        ip_or_domain = get_external_ip()
+        if not ip_or_domain:
+            # Если IP не удалось получить, оставляем заглушку для ручной подстановки
+            ip_or_domain = "<ВАШ_СТАТИЧНЫЙ_IP_ИЛИ_ДОМЕН>"
+
         vless_link = (
             f"vless://{uuid_str}@{ip_or_domain}:{port}"
             f"?security=reality&encryption=none&alpn=h2,http/1.1&headerType=none"
