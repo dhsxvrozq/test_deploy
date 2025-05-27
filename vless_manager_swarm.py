@@ -275,6 +275,17 @@ def print_usage_and_exit() -> None:
     print("  python3 vless_manager_swarm.py migrate <username> --to-node <имя_ноды>")
     sys.exit(1)
 
+def cleanup_docker_system(auto_confirm: bool = True) -> None:
+    """
+    Выполняет безопасную очистку Docker: удаляет остановленные контейнеры, неиспользуемые образы и кэш.
+    """
+    print("🧹 Выполняется очистка системы от неиспользуемых ресурсов Docker...")
+    args = ["docker", "system", "prune", "-f"] if auto_confirm else ["docker", "system", "prune"]
+    try:
+        subprocess.run(args, check=True)
+        print("✅ Очистка завершена.")
+    except subprocess.CalledProcessError as e:
+        print("⚠️ Не удалось выполнить очистку:", e)
 
 if __name__ == "__main__":
     if len(sys.argv) < 3:
@@ -355,6 +366,7 @@ if __name__ == "__main__":
     elif action == "remove":
         # –– удаляем сервис, config и освобождаем порт (через метку)
         remove_user(username)
+        cleanup_docker_system()
 
     elif action == "migrate":
         if "--to-node" not in sys.argv:
@@ -368,6 +380,7 @@ if __name__ == "__main__":
             sys.exit(1)
 
         migrate_user(username, target)
+        cleanup_docker_system()
 
     else:
         print_usage_and_exit()
