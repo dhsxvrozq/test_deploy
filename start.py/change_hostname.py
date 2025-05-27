@@ -36,15 +36,8 @@ async def set_hostname(new_hostname, ip_address="127.0.1.1"):
 
 # Запуск из командной строки
 if __name__ == "__main__":
-    if os.geteuid() != 0:
-        print("Этот скрипт нужно запускать с правами root.")
-        sys.exit(1)
 
-    if len(sys.argv) < 2:
-        print("Использование: python3 script.py <новое_имя_хоста> [ip-адрес]")
-        sys.exit(1)
-
-    hostname = sys.argv[1]
-    ip = sys.argv[2] if len(sys.argv) > 2 else "127.0.1.1"
+    hostname = 'node3'
+    ip = "127.0.1.1"
 
     asyncio.run(set_hostname(hostname, ip))
