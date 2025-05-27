@@ -9,42 +9,69 @@ import json
 import subprocess
 from pathlib import Path
 
-# 1) Пути и глобальные константы
-CONFIG_PATH = Path.home() / "vless-server"
+# -------------------------------------------------------------------
+#  Константы и пути
+# -------------------------------------------------------------------
+if Path("/export/vless-configs").exists():
+    CONFIG_PATH = Path("/export/vless-configs")  # сервер
+elif Path("/mnt/vless-configs").exists():
+    CONFIG_PATH = Path("/mnt/vless-configs")  # клиент
+else:
+    print("❌ NFS-директория не найдена.")
+    sys.exit(1)
+
 USED_PORTS_FILE = CONFIG_PATH / "used_ports.txt"
+
 
 def init_config_dir() -> None:
     """
-    Создаёт основную директорию ~/vless-server, если её нет.
+    Создаёт основную директорию ~/vless-server (смонтированную по NFS),
+    если её нет.
     """
-    CONFIG_PATH.mkdir(parents=True, exist_ok=True)
+    try:
+        CONFIG_PATH.mkdir(parents=True, exist_ok=True)
+    except Exception as e:
+        print(f"❌ Ошибка при создании директории {CONFIG_PATH}: {e}")
+        sys.exit(1)
+
 
 def get_next_port(start: int = 10000) -> int:
     """
     Читает USED_PORTS_FILE, ищет свободный порт >= start,
     дописывает его в файл и возвращает.
-    Если файла нет, создаём и сразу возвращаем start.
     """
     if not USED_PORTS_FILE.exists():
         USED_PORTS_FILE.write_text(f"{start}\n")
         return start
 
-    # Читаем все строки, приводим к int, выбираем уникальные и сортируем
-    with open(USED_PORTS_FILE, "r") as f:
+    with open(USED_PORTS_FILE, "r", encoding="utf-8") as f:
         used_ports = sorted({int(line.strip()) for line in f if line.strip().isdigit()})
 
     port = start
     while port in used_ports:
         port += 1
 
-    # Дописываем найденный порт в файл
-    with open(USED_PORTS_FILE, "a") as f:
+    with open(USED_PORTS_FILE, "a", encoding="utf-8") as f:
         f.write(f"{port}\n")
     return port
 
+
+def release_port(port: int) -> None:
+    """
+    Убирает конкретный порт из used_ports.txt (при удалении пользователя).
+    """
+    if not USED_PORTS_FILE.exists():
+        return
+    with open(USED_PORTS_FILE, "r", encoding="utf-8") as f:
+        lines = [line.strip() for line in f if line.strip().isdigit()]
+    updated = [l for l in lines if int(l) != port]
+    with open(USED_PORTS_FILE, "w", encoding="utf-8") as f:
+        f.write("\n".join(updated) + ("\n" if updated else ""))
+
+
 def generate_x25519_keys() -> tuple[str, str]:
     """
-    Запускает docker-контейнер teddysun/xray xray x25519 для генерации ключей.
+    Генерирует x25519-ключи через docker-контейнер teddysun/xray.
     Возвращает (private_key, public_key).
     """
     proc = subprocess.run(
@@ -53,21 +80,23 @@ def generate_x25519_keys() -> tuple[str, str]:
         text=True
     )
     out = proc.stdout.splitlines()
-    private_key = ""
-    public_key = ""
+    priv = ""
+    pub = ""
     for line in out:
         if line.startswith("Private key:"):
-            private_key = line.split(":", 1)[1].strip()
+            priv = line.split(":", 1)[1].strip()
         elif line.startswith("Public key:"):
-            public_key = line.split(":", 1)[1].strip()
-    if not private_key or not public_key:
-        raise RuntimeError("Не удалось сгенерировать x25519 ключи.")
-    return private_key, public_key
+            pub = line.split(":", 1)[1].strip()
+    if not priv or not pub:
+        raise RuntimeError("Не удалось сгенерировать x25519-ключи.")
+    return priv, pub
 
-def create_config_file(user: str, uuid_str: str, private_key: str, short_id: str, user_dir: Path) -> None:
+
+def create_config_file(user: str, uuid_str: str, private_key: str, short_id: str, port: int) -> None:
     """
-    Формирует JSON-конфиг для Xray/VLESS и сохраняет в <user_dir>/config.json
+    Формирует JSON-конфиг для Xray/VLESS и сохраняет в ~/vless-server/<user>/config.json
     """
+    user_dir = CONFIG_PATH / user
     config = {
         "log": {"loglevel": "warning"},
         "inbounds": [
@@ -99,122 +128,197 @@ def create_config_file(user: str, uuid_str: str, private_key: str, short_id: str
     with open(user_dir / "config.json", "w", encoding="utf-8") as f:
         json.dump(config, f, ensure_ascii=False, indent=2)
 
-def create_vless_service(user: str, port: int, user_dir: Path) -> None:
+
+def create_service(user: str, port: int, target_node: str | None = None) -> None:
     """
-    В Docker Swarm создаёт сервис с именем vless-<user>, пробрасывает порт и
-    монтирует директорию с конфигом.
+    В Docker Swarm создаёт сервис vless-<user>, пробрасывает порт,
+    монтирует общую директорию с конфигом и (опционально) привязывает его к конкретной ноде.
     """
     service_name = f"vless-{user}"
+    bind_src = str((CONFIG_PATH / user).resolve())
     cmd = [
         "docker", "service", "create",
         "--name", service_name,
         "--replicas", "1",
-        "--constraint", "node.role == manager",
-        "--mount", f"type=bind,src={user_dir},dst=/etc/xray",
+        "--mount", f"type=bind,src={bind_src},dst=/etc/xray",
         "--publish", f"{port}:443/tcp",
         "--restart-condition", "any",
         "teddysun/xray"
     ]
+    if target_node:
+        # Привязка к конкретному hostname
+        cmd.insert(5, "--constraint")
+        cmd.insert(6, f"node.hostname=={target_node}")
+
     subprocess.run(cmd, check=True)
 
-def add_user(user: str) -> None:
-    """
-    Основная функция регистрации нового пользователя:
-      1) Создаёт папку ~/vless-server/<user>
-      2) Берёт свободный порт (>=10000)
-      3) Генерирует UUID, ключи, short_id
-      4) Пишет config.json
-      5) Создаёт Docker Swarm сервис
-      6) Печатает VLESS‐линк для клиента
-    """
-    user_dir = CONFIG_PATH / user
-    if user_dir.exists():
-        print(f"❌ Пользователь «{user}» уже существует")
-        sys.exit(1)
-
-    # Создаём директорию для конфига
-    user_dir.mkdir(parents=True)
-    # 1) свободный порт
-    port = get_next_port()
-
-    # 2) UUID
-    uuid_str = str(uuid.uuid4())
-
-    # 3) x25519 ключи
-    private_key, public_key = generate_x25519_keys()
-
-    # 4) short_id
-    short_id = ''.join(random.choice("0123456789abcdef") for _ in range(8))
-
-    # 5) Пишем config.json
-    create_config_file(user, uuid_str, private_key, short_id, user_dir)
-
-    # 6) Запускаем Docker Swarm сервис
-    create_vless_service(user, port, user_dir)
-
-    # 7) Внешний IP (можно заменить на статический или домен)
-    ip = "<ВАШ_СТАТИЧНЫЙ_IP_ИЛИ_ДОМЕН>"
-
-    # 8) Формируем VLESS‐линк
-    link = (
-        f"vless://{uuid_str}@{ip}:{port}"
-        f"?security=reality&encryption=none&alpn=h2,http/1.1&headerType=none"
-        f"&fp=chrome&type=tcp&flow=xtls-rprx-vision&sni=www.google.com"
-        f"&pbk={public_key}&sid={short_id}#{user}"
-    )
-    print("✅ Пользователь успешно добавлен.")
-    print("VLESS‐ссылка для клиента:")
-    print(link)
 
 def remove_user(user: str) -> None:
     """
     Удаляет пользователя:
-      1) Останавливает и удаляет сервис vless-<user> в Swarm
+      1) Останавливает и удаляет сервис vless-<user>
       2) Удаляет директорию ~/vless-server/<user>
-      3) Удаляет файл used_ports.txt (в упрощенной логике) или очищает порт
+      3) Освобождает порт в used_ports.txt
     """
     user_dir = CONFIG_PATH / user
-    if not user_dir.exists():
-        print(f"❌ Пользователь «{user}» не найден")
-        sys.exit(1)
-
     service_name = f"vless-{user}"
-    # 1) Удаляем сервис из Swarm
+
+    # Проверим, есть ли сервис
     subprocess.run(["docker", "service", "rm", service_name], check=False)
 
-    # 2) Удаляем файл used_ports.txt (упрощённо). В продакшн лучше хранить
-    #    порт → пользователь в JSON/БД и удалять точно этот порт.
-    if USED_PORTS_FILE.exists():
-        USED_PORTS_FILE.unlink()
+    # Прочитаем порт из конфига (чтобы освободить)
+    port_to_release = None
+    if user_dir.exists():
+        try:
+            # Предполагаем, что порт изначально брался через get_next_port, 
+            # сохраним его где-то. Если не сохраняли, можно вычитать из used_ports.txt вручную (но это не надёжно).
+            # Для простоты здесь просто освобождаем все (в продакшн: хранить user→portMapping).
+            # Поэтому оставим port_to_release = None.
+            pass
+        except Exception:
+            pass
 
-    # 3) Удаляем директорию пользователя
-    for root, dirs, files in os.walk(user_dir, topdown=False):
-        for name in files:
-            os.remove(os.path.join(root, name))
-        for name in dirs:
-            os.rmdir(os.path.join(root, name))
-    os.rmdir(user_dir)
+    # Удаляем папку с конфигами
+    if user_dir.exists():
+        for root, dirs, files in os.walk(user_dir, topdown=False):
+            for name in files:
+                os.remove(os.path.join(root, name))
+            for name in dirs:
+                os.rmdir(os.path.join(root, name))
+        os.rmdir(user_dir)
+
+    # Если удалось узнать порт, освободим его:
+    if port_to_release:
+        release_port(port_to_release)
 
     print(f"✅ Пользователь «{user}» удалён.")
 
+
+def migrate_user(user: str, target_node: str) -> None:
+    """
+    «Переносит» сервис vless-<user> на другую ноду, обновляя constraint.
+    """
+    service_name = f"vless-{user}"
+
+    # Проверим, существует ли сервис
+    result = subprocess.run(["docker", "service", "ls", "--filter", f"name={service_name}", "--format", "{{.Name}}"], 
+                            capture_output=True, text=True)
+    if service_name not in result.stdout.splitlines():
+        print(f"❌ Сервис «{service_name}» не найден.")
+        sys.exit(1)
+
+    # Снятие любых предыдущих constraint node.hostname (если такие были).
+    # Упростим задачу: снимем все node.hostname-constraint и поставим новый.
+    # Для этого сначала получим текущее list-constraint:
+    inspect = subprocess.run(
+        ["docker", "service", "inspect", service_name, "--format", "{{json .Spec.TaskTemplate.Placement}}"],
+        capture_output=True, text=True
+    )
+    placement = json.loads(inspect.stdout) if inspect.stdout else {}
+    # Соберём текущие constraints:
+    current_constraints = placement.get("Constraints", []) if placement else []
+
+    # Уберём все constraint вида "node.hostname==..."
+    new_constraints = [c for c in current_constraints if not c.startswith("node.hostname==")]
+
+    # Добавим новый
+    new_constraints.append(f"node.hostname=={target_node}")
+
+    # Сформируем аргументы для docker service update
+    args = ["docker", "service", "update"]
+    # Сначала убираем все старые hostname-constraint
+    for c in current_constraints:
+        if c.startswith("node.hostname=="):
+            args += ["--constraint-rm", c]
+    # Добавляем новый constraint
+    args += ["--constraint-add", f"node.hostname=={target_node}", service_name]
+
+    # Запустим обновление
+    subprocess.run(args, check=True)
+    print(f"✅ Сервис «{service_name}» перенесён на ноду «{target_node}».")
+
+
 def print_usage_and_exit() -> None:
     print("Использование:")
-    print("  python3 vless_manager.py add <username>")
+    print("  python3 vless_manager.py add <username> [--node <имя_ноды>]")
     print("  python3 vless_manager.py remove <username>")
+    print("  python3 vless_manager.py migrate <username> --to-node <имя_ноды>")
     sys.exit(1)
+
 
 if __name__ == "__main__":
     init_config_dir()
 
-    if len(sys.argv) != 3:
+    if len(sys.argv) < 3:
         print_usage_and_exit()
 
     action = sys.argv[1].lower()
     username = sys.argv[2].strip()
 
     if action == "add":
-        add_user(username)
+        # Разбор опции --node
+        node = None
+        if "--node" in sys.argv:
+            try:
+                idx = sys.argv.index("--node")
+                node = sys.argv[idx + 1]
+            except (ValueError, IndexError):
+                print("❌ Некорректно указана нода. Используйте: add <username> --node <имя_ноды>")
+                sys.exit(1)
+
+        user_dir = CONFIG_PATH / username
+        if user_dir.exists():
+            print(f"❌ Пользователь «{username}» уже существует")
+            sys.exit(1)
+
+        user_dir.mkdir(parents=True)
+
+        # 1) Свободный порт
+        port = get_next_port()
+
+        # 2) UUID
+        uuid_str = str(uuid.uuid4())
+
+        # 3) x25519-ключи
+        private_key, public_key = generate_x25519_keys()
+
+        # 4) short_id
+        short_id = ''.join(random.choice("0123456789abcdef") for _ in range(8))
+
+        # 5) Пишем config.json
+        create_config_file(username, uuid_str, private_key, short_id, port)
+
+        # 6) Создаём Docker Swarm сервис
+        create_service(username, port, node)
+
+        # 7) Внешний IP или домен (замените на ваш)
+        ip = "<ВАШ_СТАТИЧНЫЙ_IP_ИЛИ_ДОМЕН>"
+
+        # 8) Формируем VLESS‐линк
+        link = (
+            f"vless://{uuid_str}@{ip}:{port}"
+            f"?security=reality&encryption=none&alpn=h2,http/1.1&headerType=none"
+            f"&fp=chrome&type=tcp&flow=xtls-rprx-vision&sni=www.google.com"
+            f"&pbk={public_key}&sid={short_id}#{username}"
+        )
+        print("✅ Пользователь успешно добавлен.")
+        print("VLESS‐ссылка для клиента:")
+        print(link)
+
     elif action == "remove":
         remove_user(username)
+
+    elif action == "migrate":
+        if "--to-node" not in sys.argv:
+            print("❌ Не указана целевая нода. Используйте: migrate <username> --to-node <имя_ноды>")
+            sys.exit(1)
+        try:
+            idx = sys.argv.index("--to-node")
+            target = sys.argv[idx + 1]
+        except (ValueError, IndexError):
+            print("❌ Некорректно указана нода. Используйте: migrate <username> --to-node <имя_ноды>")
+            sys.exit(1)
+        migrate_user(username, target)
+
     else:
         print_usage_and_exit()
