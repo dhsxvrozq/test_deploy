@@ -176,13 +176,13 @@ def create_service(username: str, port: int, target_node: str | None = None) -> 
     )
 
     cmd = [
-        "docker", "service", "create",
-        "--name", service_name,
-        "--replicas", "1",
-        "--publish", f"{port}:443/tcp",
-        "--restart-condition", "any",
-        "--config", f"source={config_name},target=/etc/xray/config.json",
-        "teddysun/xray"
+    "docker", "service", "create",
+    "--name", service_name,
+    "--replicas", "1",
+    "--publish", f"mode=host,target=443,published={port},protocol=tcp",
+    "--restart-condition", "any",
+    "--config", f"source={config_name},target=/etc/xray/config.json",
+    "teddysun/xray"
     ]
     if target_node:
         cmd.insert(5, "--constraint")
