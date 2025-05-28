@@ -9,20 +9,34 @@ import json
 import subprocess
 import urllib.request
 from pathlib import Path
+import time
 
 # -------------------------------------------------------------------
-#  Константы и пути
+# Константы и пути
 # -------------------------------------------------------------------
 BASE_DIR = Path(__file__).parent.resolve()
 USED_PORTS_FILE = BASE_DIR / "used_ports.txt"
-CONFIG_NAME_PREFIX = "vless-config"   # префикс для docker config: vless-config-<username>
+CONFIG_NAME_PREFIX = "vless-config"  # префикс для docker config: vless-config-<username>
+RECORD_ID_FILE = BASE_DIR / "record_ids.json"  # файл для хранения RECORD_ID
+BASE_DOMAIN = "vpn.example.com"  # базовый домен (настройте под себя)
+TTL = 60  # TTL для DNS-записей в секундах
 
+def load_record_ids() -> dict:
+    """Загружает RECORD_ID из файла."""
+    if RECORD_ID_FILE.exists():
+        with open(RECORD_ID_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {}
+
+def save_record_ids(record_ids: dict) -> None:
+    """Сохраняет RECORD_ID в файл."""
+    with open(RECORD_ID_FILE, "w", encoding="utf-8") as f:
+        json.dump(record_ids, f, indent=2)
 
 def get_next_port(start: int = 10000) -> int:
-    """
-    Читает USED_PORTS_FILE (./used_ports.txt), ищет первый свободный порт >= start,
-    дописывает его в файл и возвращает.
-    """
+    """Находит и возвра
+
+щает следующий свободный порт, записывая его в used_ports.txt."""
     if not USED_PORTS_FILE.exists():
         USED_PORTS_FILE.write_text(f"{start}\n")
         return start
@@ -38,11 +52,8 @@ def get_next_port(start: int = 10000) -> int:
         f.write(f"{port}\n")
     return port
 
-
 def release_port(port: int) -> None:
-    """
-    Убирает конкретный порт из used_ports.txt (при удалении пользователя).
-    """
+    """Освобождает указанный порт из used_ports.txt."""
     if not USED_PORTS_FILE.exists():
         return
     with open(USED_PORTS_FILE, "r", encoding="utf-8") as f:
@@ -54,19 +65,15 @@ def release_port(port: int) -> None:
         else:
             f.write("")
 
-
 def generate_x25519_keys() -> tuple[str, str]:
-    """
-    Генерирует x25519-ключи через Docker-контейнер teddysun/xray.
-    Возвращает (private_key, public_key).
-    """
+    """Генерирует x25519-ключи через Docker-контейнер teddysun/xray."""
     proc = subprocess.run(
         ["docker", "run", "--rm", "teddysun/xray", "xray", "x25519"],
         capture_output=True,
         text=True
     )
     if proc.returncode != 0:
-        print("❌ Ошибка при запуске контейнера teddysun/xray для генерации ключей.")
+        print("❌ Ошибка при генерации ключей x25519.")
         print(proc.stderr)
         sys.exit(1)
 
@@ -82,21 +89,13 @@ def generate_x25519_keys() -> tuple[str, str]:
         raise RuntimeError("Не удалось сгенерировать x25519-ключи.")
     return priv, pub
 
-
 def create_docker_config(username: str, config_json: dict) -> None:
-    """
-    Создаёт Docker config c именем vless-config-<username> со своим JSON-содержимым.
-    Если config с таким именем уже есть — удаляет старый и создаёт заново.
-    """
+    """Создаёт Docker config для пользователя."""
     config_name = f"{CONFIG_NAME_PREFIX}-{username}"
-
-    # Если конфиг с таким именем уже есть, удалим
     subprocess.run(
         ["docker", "config", "rm", config_name],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
     )
-
-    # Сериализуем JSON и передаём в stdin для `docker config create`
     json_bytes = json.dumps(config_json, ensure_ascii=False, indent=2).encode("utf-8")
     proc = subprocess.run(
         ["docker", "config", "create", config_name, "-"],
@@ -109,12 +108,8 @@ def create_docker_config(username: str, config_json: dict) -> None:
         print(proc.stderr.decode("utf-8"))
         sys.exit(1)
 
-
 def create_config_object(username: str, uuid_str: str, private_key: str, short_id: str) -> dict:
-    """
-    Формирует Python-словарь (dict) с JSON-конфигом для Xray/VLESS.
-    Возвращает этот словарь.
-    """
+    """Создаёт JSON-конфиг для Xray/VLESS."""
     return {
         "log": {"loglevel": "warning"},
         "inbounds": [
@@ -122,9 +117,7 @@ def create_config_object(username: str, uuid_str: str, private_key: str, short_i
                 "port": 443,
                 "protocol": "vless",
                 "settings": {
-                    "clients": [
-                        {"id": uuid_str, "flow": "xtls-rprx-vision"}
-                    ],
+                    "clients": [{"id": uuid_str, "flow": "xtls-rprx-vision"}],
                     "decryption": "none"
                 },
                 "streamSettings": {
@@ -144,26 +137,8 @@ def create_config_object(username: str, uuid_str: str, private_key: str, short_i
         "outbounds": [{"protocol": "freedom"}]
     }
 
-
-def get_external_ip() -> str:
-    """
-    Определяет внешний публичный IP сервера через сервис api.ipify.org.
-    Возвращает строку с IP или пустую строку при ошибке.
-    """
-    try:
-        with urllib.request.urlopen("https://api.ipify.org") as response:
-            ip = response.read().decode('utf-8').strip()
-            return ip
-    except Exception as e:
-        print(f"⚠️ Не удалось определить внешний IP: {e}")
-        return ""
-
-
 def get_node_ip(node_name: str) -> str:
-    """
-    Получает IP конкретной ноды в Docker Swarm.
-    Возвращает IP ноды или пустую строку при ошибке.
-    """
+    """Получает IP-адрес ноды в Docker Swarm."""
     try:
         proc = subprocess.run(
             ["docker", "node", "inspect", node_name, "--format", "{{.Status.Addr}}"],
@@ -174,23 +149,14 @@ def get_node_ip(node_name: str) -> str:
         print(f"⚠️ Не удалось получить IP ноды {node_name}")
         return ""
 
-
 def create_service(username: str, port: int, target_node: str | None = None) -> None:
-    """
-    В Docker Swarm создаёт сервис vless-<username>:
-      • пробрасывает порт <port>:443/tcp с mode=host
-      • монтирует ранее созданный Docker config (vless-config-<username>) в /etc/xray/config.json
-      • (опционально) привязывает сервис к конкретной ноде через --constraint node.hostname==<target_node>
-    """
+    """Создаёт VLESS-сервис в Docker Swarm."""
     service_name = f"vless-{username}"
     config_name = f"{CONFIG_NAME_PREFIX}-{username}"
-
-    # Удаляем старый сервис, если вдруг он уже есть (чтобы не было конфликтов)
     subprocess.run(
         ["docker", "service", "rm", service_name],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
     )
-
     cmd = [
         "docker", "service", "create",
         "--name", service_name,
@@ -202,27 +168,115 @@ def create_service(username: str, port: int, target_node: str | None = None) -> 
         "teddysun/xray"
     ]
     if target_node:
-        cmd.insert(5, "--constraint")
-        cmd.insert(6, f"node.hostname=={target_node}")
-
+        cmd.extend(["--constraint", f"node.hostname=={target_node}"])
     proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     if proc.returncode != 0:
         print(f"❌ Не удалось создать сервис «{service_name}»")
         print(proc.stderr.decode("utf-8"))
         sys.exit(1)
 
+def add_subdomain(username: str, domain: str = BASE_DOMAIN) -> bool:
+    """Добавляет поддомен для пользователя."""
+    subdomain = f"{username}.{domain}"
+    cmd = ["twc", "domain", "subdomain", "add", subdomain, "--output", "json"]
+    try:
+        subprocess.run(cmd, check=True, capture_output=True, text=True)
+        print(f"✅ Поддомен {subdomain} создан.")
+        return True
+    except subprocess.CalledProcessError as e:
+        print(f"❌ Не удалось создать поддомен {subdomain}: {e.stderr}")
+        return False
+
+def add_dns_record(username: str, ip: str, domain: str = BASE_DOMAIN, ttl: int = TTL) -> str:
+    """Добавляет A-запись для поддомена."""
+    subdomain = f"{username}.{domain}"
+    cmd = [
+        "twc", "domain", "record", "add", subdomain,
+        "--type", "A", "--value", ip, "--ttl", str(ttl), "--output", "json"
+    ]
+    try:
+        proc = subprocess.run(cmd, check=True, capture_output=True, text=True)
+        result = json.loads(proc.stdout)
+        record_id = result.get("id", "")
+        print(f"✅ A-запись для {subdomain} создана с IP {ip}.")
+        return record_id
+    except subprocess.CalledProcessError as e:
+        print(f"❌ Не удалось создать A-запись для {subdomain}: {e.stderr}")
+        return ""
+
+def update_dns_record(username: str, new_ip: str, record_id: str, domain: str = BASE_DOMAIN, ttl: int = TTL) -> bool:
+    """Обновляет A-запись поддомена."""
+    subdomain = f"{username}.{domain}"
+    cmd = [
+        "twc", "domain", "record", "update", subdomain, record_id,
+        "--type", "A", "--value", new_ip, "--ttl", str(ttl), "--output", "json"
+    ]
+    try:
+        subprocess.run(cmd, check=True, capture_output=True, text=True)
+        print(f"✅ A-запись для {subdomain} обновлена на {new_ip}.")
+        return True
+    except subprocess.CalledProcessError as e:
+        print(f"❌ Не удалось обновить A-запись для {subdomain}: {e.stderr}")
+        return False
+
+def remove_subdomain(username: str, domain: str = BASE_DOMAIN) -> None:
+    """Удаляет поддомен пользователя."""
+    subdomain = f"{username}.{domain}"
+    cmd = ["twc", "domain", "subdomain", "remove", subdomain, "-y"]
+    try:
+        subprocess.run(cmd, check=True, capture_output=True, text=True)
+        print(f"✅ Поддомен {subdomain} удалён.")
+    except subprocess.CalledProcessError as e:
+        print(f"⚠️ Не удалось удалить поддомен {subdomain}: {e.stderr}")
+
+def setup_proxy(old_node: str, new_ip: str, port: int, ttl: int = TTL) -> None:
+    """Настраивает временное проксирование на старой ноде."""
+    old_ip = get_node_ip(old_node)
+    if not old_ip:
+        print(f"⚠️ Не удалось получить IP старой ноды {old_node}, пропускаем прокси.")
+        return
+
+    iptables_cmd = [
+        "ssh", f"root@{old_ip}",
+        "iptables", "-t", "nat",
+        "-A", "PREROUTING", "-p", "tcp", "--dport", str(port),
+        "-j", "DNAT", "--to-destination", f"{new_ip}:{port}"
+    ]
+    iptables_masquerade = [
+        "ssh", f"root@{old_ip}",
+        "iptables", "-t", "nat",
+        "-A", "POSTROUTING", "-j", "MASQUERADE"
+    ]
+    try:
+        subprocess.run(iptables_cmd, check=True, capture_output=True)
+        subprocess.run(iptables_masquerade, check=True, capture_output=True)
+        print(f"✅ Прокси настроен на {old_node} ({old_ip}) для порта {port} -> {new_ip}:{port}")
+
+        time.sleep(ttl)
+
+        iptables_remove = [
+            "ssh", f"root@{old_ip}",
+            "iptables", "-t", "nat",
+            "-D", "PREROUTING", "-p", "tcp", "--dport", str(port),
+            "-j", "DNAT", "--to-destination", f"{new_ip}:{port}"
+        ]
+        iptables_remove_masquerade = [
+            "ssh", f"root@{old_ip}",
+            "iptables", "-t", "nat",
+            "-D", "POSTROUTING", "-j", "MASQUERADE"
+        ]
+        subprocess.run(iptables_remove, check=True, capture_output=True)
+        subprocess.run(iptables_remove_masquerade, check=True, capture_output=True)
+        print(f"✅ Прокси на {old_node} ({old_ip}) удалён.")
+    except subprocess.CalledProcessError as e:
+        print(f"⚠️ Ошибка настройки прокси на {old_node}: {e.stderr}")
 
 def remove_user(username: str) -> None:
-    """
-    Удаляет пользователя:
-      1) Останавливает и удаляет сервис vless-<username>
-      2) Удаляет Docker config vless-config-<username>
-      3) Освобождает порт (если удалось его узнать)
-    """
+    """Удаляет пользователя и связанные ресурсы."""
     service_name = f"vless-{username}"
     config_name = f"{CONFIG_NAME_PREFIX}-{username}"
+    subdomain = f"{username}.{BASE_DOMAIN}"
 
-    # Сначала пытаемся получить порт из меток сервиса
     port_to_release = None
     try:
         inspect = subprocess.run(
@@ -232,34 +286,42 @@ def remove_user(username: str) -> None:
         )
         if inspect.returncode == 0 and inspect.stdout.strip():
             labels = json.loads(inspect.stdout)
-            if labels and "vless-port" in labels:
+            if "vless-port" in labels:
                 port_to_release = int(labels["vless-port"])
     except Exception:
         pass
 
-    # 1) Удаляем сервис
-    result = subprocess.run(["docker", "service", "rm", service_name], capture_output=True)
-    if result.returncode != 0:
-        print(f"⚠️ Сервис «{service_name}» не найден или уже удалён.")
-
-    # 2) Удаляем Docker config
+    subprocess.run(["docker", "service", "rm", service_name], capture_output=True)
     subprocess.run(["docker", "config", "rm", config_name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-    # 3) Освобождаем порт
     if port_to_release:
         release_port(port_to_release)
 
+    cmd = ["twc", "domain", "record", "list", subdomain, "--output", "json"]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        records = json.loads(proc.stdout)
+        for record in records:
+            if record.get("type") == "A" and record.get("name") == subdomain:
+                subprocess.run(
+                    ["twc", "domain", "record", "remove", subdomain, record.get("id"), "-y"],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                )
+                print(f"✅ A-запись для {subdomain} удалена.")
+    except subprocess.CalledProcessError as e:
+        print(f"⚠️ Не удалось удалить DNS-записи для {subdomain}: {e.stderr}")
+
+    remove_subdomain(username)
+    record_ids = load_record_ids()
+    if username in record_ids:
+        del record_ids[username]
+        save_record_ids(record_ids)
     print(f"✅ Пользователь «{username}» удалён.")
 
-
 def migrate_user(username: str, target_node: str) -> None:
-    """
-    Переносит сервис vless-<username> на другую ноду, обновляя constraint:
-      • docker service update --constraint-rm ... --constraint-add node.hostname==<target_node> ...
-    """
+    """Переносит сервис пользователя на новую ноду."""
     service_name = f"vless-{username}"
+    subdomain = f"{username}.{BASE_DOMAIN}"
 
-    # Проверим, существует ли сервис
     result = subprocess.run(
         ["docker", "service", "ls", "--filter", f"name={service_name}", "--format", "{{.Name}}"],
         capture_output=True, text=True
@@ -268,7 +330,36 @@ def migrate_user(username: str, target_node: str) -> None:
         print(f"❌ Сервис «{service_name}» не найден.")
         sys.exit(1)
 
-    # Получаем текущее Placement (список constraints)
+    current_node = subprocess.run(
+        ["docker", "service", "ps", service_name, "--format", "{{.Node}}"],
+        capture_output=True, text=True
+    ).stdout.strip()
+    if not current_node:
+        print(f"⚠️ Не удалось определить текущую ноду сервиса {service_name}.")
+
+    new_ip = get_node_ip(target_node)
+    if not new_ip:
+        print(f"❌ Не удалось получить IP ноды {target_node}.")
+        sys.exit(1)
+
+    inspect = subprocess.run(
+        ["docker", "service", "inspect", service_name, "--format", "{{json .Spec.Labels}}"],
+        capture_output=True, text=True
+    )
+    labels = json.loads(inspect.stdout) if inspect.stdout.strip() else {}
+    port = int(labels.get("vless-port", 0))
+    if not port:
+        print(f"❌ Не удалось определить порт сервиса {service_name}.")
+        sys.exit(1)
+
+    record_ids = load_record_ids()
+    record_id = record_ids.get(username)
+    if not record_id:
+        print(f"❌ Не найдена RECORD_ID для {subdomain}.")
+        sys.exit(1)
+
+    setup_proxy(current_node, new_ip, port)
+
     inspect = subprocess.run(
         ["docker", "service", "inspect", service_name, "--format", "{{json .Spec.TaskTemplate.Placement}}"],
         capture_output=True, text=True
@@ -276,7 +367,6 @@ def migrate_user(username: str, target_node: str) -> None:
     placement = json.loads(inspect.stdout) if inspect.stdout.strip() else {}
     current_constraints = placement.get("Constraints", []) if placement else []
 
-    # Убираем все node.hostname==* и добавляем новую привязку
     args = ["docker", "service", "update"]
     for c in current_constraints:
         if c.startswith("node.hostname=="):
@@ -289,85 +379,78 @@ def migrate_user(username: str, target_node: str) -> None:
         print(proc.stderr.decode("utf-8"))
         sys.exit(1)
 
+    if not update_dns_record(username, new_ip, record_id):
+        print("⚠️ Перенос успешен, но DNS не обновлён.")
     print(f"✅ Сервис «{service_name}» перенесён на ноду «{target_node}».")
 
-
-def print_usage_and_exit() -> None:
-    print("Использование:")
-    print("  python3 vless_manager_swarm.py add <username> [--node <имя_ноды>]")
-    print("  python3 vless_manager_swarm.py remove <username>")
-    print("  python3 vless_manager_swarm.py migrate <username> --to-node <имя_ноды>")
-    sys.exit(1)
-
-
 def cleanup_docker_system(auto_confirm: bool = True) -> None:
-    """
-    Выполняет безопасную очистку Docker: удаляет остановленные контейнеры, неиспользуемые образы и кэш.
-    """
-    print("🧹 Выполняется очистка системы от неиспользуемых ресурсов Docker...")
+    """Очищает неиспользуемые Docker-ресурсы."""
+    print("🧹 Очистка системы Docker...")
     args = ["docker", "system", "prune", "-f"] if auto_confirm else ["docker", "system", "prune"]
     try:
         subprocess.run(args, check=True)
         print("✅ Очистка завершена.")
     except subprocess.CalledProcessError as e:
-        print("⚠️ Не удалось выполнить очистку:", e)
-
+        print(f"⚠️ Ошибка очистки: {e}")
 
 if __name__ == "__main__":
     if len(sys.argv) < 3:
-        print_usage_and_exit()
+        print("Использование: python3 vless_manager_swarm.py add <username> [--node <имя_ноды>] | remove <username> | migrate <username> --to-node <имя_ноды>")
+        sys.exit(1)
 
     action = sys.argv[1].lower()
     username = sys.argv[2].strip()
 
     if action == "add":
-        # Разбор опции --node
         node = None
         if "--node" in sys.argv:
             try:
                 idx = sys.argv.index("--node")
                 node = sys.argv[idx + 1]
             except (ValueError, IndexError):
-                print("❌ Некорректно указана нода. Используйте: add <username> --node <имя_ноды>")
+                print("❌ Ошибка: --node указан некорректно.")
                 sys.exit(1)
 
-        # 1) Генерация случайных параметров
         port = get_next_port()
         uuid_str = str(uuid.uuid4())
         private_key, public_key = generate_x25519_keys()
         short_id = "".join(random.choice("0123456789abcdef") for _ in range(8))
 
-        # 2) Составляем JSON-конфиг в виде Python-словаря
         config_dict = create_config_object(username, uuid_str, private_key, short_id)
-
-        # 3) Создаём Docker config (внутри Swarm) с этим JSON
         create_docker_config(username, config_dict)
 
-        # 4) Создаём сервис
-        try:
-            create_service(username, port, node)
-        except Exception as e:
-            print(f"❌ Ошибка при создании сервиса: {e}")
-            # Если сервис не создался, удалим созданный config и освободим порт
-            subprocess.run(["docker", "config", "rm", f"{CONFIG_NAME_PREFIX}-{username}"], 
-                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        node_ip = get_node_ip(node) if node else ""
+        if not add_subdomain(username):
+            print("❌ Ошибка создания поддомена, прерываем.")
+            subprocess.run(["docker", "config", "rm", f"{CONFIG_NAME_PREFIX}-{username}"],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             release_port(port)
             sys.exit(1)
 
-        # 5) Определяем IP для VLESS-ссылки
-        if node:
-            # Если указана конкретная нода, пытаемся получить её IP
-            node_ip = get_node_ip(node)
-            ip_or_domain = node_ip if node_ip else get_external_ip()
-        else:
-            # Если нода не указана, используем общий IP
-            ip_or_domain = get_external_ip()
-        
-        if not ip_or_domain:
-            # Если IP не удалось получить, оставляем заглушку для ручной подстановки
-            ip_or_domain = "<ВАШ_СТАТИЧНЫЙ_IP_ИЛИ_ДОМЕН>"
+        record_id = add_dns_record(username, node_ip)
+        if not record_id:
+            print("❌ Ошибка создания DNS-записи, прерываем.")
+            subprocess.run(["docker", "config", "rm", f"{CONFIG_NAME_PREFIX}-{username}"],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            release_port(port)
+            remove_subdomain(username)
+            sys.exit(1)
 
-        # 6) Собираем VLESS-ссылку для клиента
+        record_ids = load_record_ids()
+        record_ids[username] = record_id
+        save_record_ids(record_ids)
+
+        try:
+            create_service(username, port, node)
+        except Exception as e:
+            print(f"❌ Ошибка создания сервиса: {e}")
+            subprocess.run(["docker", "config", "rm", f"{CONFIG_NAME_PREFIX}-{username}"],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            release_port(port)
+            remove_subdomain(username)
+            sys.exit(1)
+
+        ip_or_domain = f"{username}.{BASE_DOMAIN}"
         vless_link = (
             f"vless://{uuid_str}@{ip_or_domain}:{port}"
             f"?security=reality&encryption=none&alpn=h2,http/1.1&headerType=none"
@@ -386,17 +469,18 @@ if __name__ == "__main__":
 
     elif action == "migrate":
         if "--to-node" not in sys.argv:
-            print("❌ Не указана целевая нода. Используйте: migrate <username> --to-node <имя_ноды>")
+            print("❌ Ошибка: укажите --to-node <имя_ноды>.")
             sys.exit(1)
         try:
             idx = sys.argv.index("--to-node")
             target = sys.argv[idx + 1]
         except (ValueError, IndexError):
-            print("❌ Некорректно указана нода. Используйте: migrate <username> --to-node <имя_ноды>")
+            print("❌ Ошибка: --to-node указан некорректно.")
             sys.exit(1)
 
         migrate_user(username, target)
         cleanup_docker_system()
 
     else:
-        print_usage_and_exit()
+        print("Использование: python3 vless_manager_swarm.py add <username> [--node <имя_ноды>] | remove <username> | migrate <username> --to-node <имя_ноды>")
+        sys.exit(1)
