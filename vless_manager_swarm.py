@@ -159,10 +159,26 @@ def get_external_ip() -> str:
         return ""
 
 
+def get_node_ip(node_name: str) -> str:
+    """
+    Получает IP конкретной ноды в Docker Swarm.
+    Возвращает IP ноды или пустую строку при ошибке.
+    """
+    try:
+        proc = subprocess.run(
+            ["docker", "node", "inspect", node_name, "--format", "{{.Status.Addr}}"],
+            capture_output=True, text=True, check=True
+        )
+        return proc.stdout.strip()
+    except subprocess.CalledProcessError:
+        print(f"⚠️ Не удалось получить IP ноды {node_name}")
+        return ""
+
+
 def create_service(username: str, port: int, target_node: str | None = None) -> None:
     """
     В Docker Swarm создаёт сервис vless-<username>:
-      • пробрасывает порт <port>:443/tcp
+      • пробрасывает порт <port>:443/tcp с mode=host
       • монтирует ранее созданный Docker config (vless-config-<username>) в /etc/xray/config.json
       • (опционально) привязывает сервис к конкретной ноде через --constraint node.hostname==<target_node>
     """
@@ -176,13 +192,14 @@ def create_service(username: str, port: int, target_node: str | None = None) -> 
     )
 
     cmd = [
-    "docker", "service", "create",
-    "--name", service_name,
-    "--replicas", "1",
-    "--publish", f"mode=host,target=443,published={port},protocol=tcp",
-    "--restart-condition", "any",
-    "--config", f"source={config_name},target=/etc/xray/config.json",
-    "teddysun/xray"
+        "docker", "service", "create",
+        "--name", service_name,
+        "--replicas", "1",
+        "--publish", f"mode=host,target=443,published={port},protocol=tcp",
+        "--restart-condition", "any",
+        "--config", f"source={config_name},target=/etc/xray/config.json",
+        "--label", f"vless-port={port}",
+        "teddysun/xray"
     ]
     if target_node:
         cmd.insert(5, "--constraint")
@@ -205,25 +222,32 @@ def remove_user(username: str) -> None:
     service_name = f"vless-{username}"
     config_name = f"{CONFIG_NAME_PREFIX}-{username}"
 
-    # 1) Удаляем сервис (игнорируем ошибку, если его нет)
-    subprocess.run(["docker", "service", "rm", service_name], check=False)
-
-    # 2) Удаляем Docker config (игнорируем ошибку, если его нет)
-    subprocess.run(["docker", "config", "rm", config_name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-    # 3) Освобождаем порт:
+    # Сначала пытаемся получить порт из меток сервиса
+    port_to_release = None
     try:
         inspect = subprocess.run(
             ["docker", "service", "inspect", service_name,
              "--format", "{{json .Spec.Labels}}"],
             capture_output=True, text=True, check=False
         )
-        labels = json.loads(inspect.stdout) if inspect.stdout.strip() else {}
-        if labels and "vless-port" in labels:
-            port_to_release = int(labels["vless-port"])
-            release_port(port_to_release)
+        if inspect.returncode == 0 and inspect.stdout.strip():
+            labels = json.loads(inspect.stdout)
+            if labels and "vless-port" in labels:
+                port_to_release = int(labels["vless-port"])
     except Exception:
         pass
+
+    # 1) Удаляем сервис
+    result = subprocess.run(["docker", "service", "rm", service_name], capture_output=True)
+    if result.returncode != 0:
+        print(f"⚠️ Сервис «{service_name}» не найден или уже удалён.")
+
+    # 2) Удаляем Docker config
+    subprocess.run(["docker", "config", "rm", config_name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    # 3) Освобождаем порт
+    if port_to_release:
+        release_port(port_to_release)
 
     print(f"✅ Пользователь «{username}» удалён.")
 
@@ -275,6 +299,7 @@ def print_usage_and_exit() -> None:
     print("  python3 vless_manager_swarm.py migrate <username> --to-node <имя_ноды>")
     sys.exit(1)
 
+
 def cleanup_docker_system(auto_confirm: bool = True) -> None:
     """
     Выполняет безопасную очистку Docker: удаляет остановленные контейнеры, неиспользуемые образы и кэш.
@@ -286,6 +311,7 @@ def cleanup_docker_system(auto_confirm: bool = True) -> None:
         print("✅ Очистка завершена.")
     except subprocess.CalledProcessError as e:
         print("⚠️ Не удалось выполнить очистку:", e)
+
 
 if __name__ == "__main__":
     if len(sys.argv) < 3:
@@ -317,42 +343,31 @@ if __name__ == "__main__":
         # 3) Создаём Docker config (внутри Swarm) с этим JSON
         create_docker_config(username, config_dict)
 
-        # 4) Создаём сервис, монтируя только что созданный config
-        #    Добавляем метку vless-port=<port>, чтобы потом при удалении узнать порт
-        label = f"vless-port={port}"
-        cmd_labels = ["--label", label]
-
-        # Формируем команду "docker service create"
-        service_name = f"vless-{username}"
-        docker_cmd = [
-            "docker", "service", "create",
-            "--name", service_name,
-            "--replicas", "1",
-            "--publish", f"{port}:443/tcp",
-            "--restart-condition", "any",
-            "--config", f"source={CONFIG_NAME_PREFIX}-{username},target=/etc/xray/config.json",
-            *cmd_labels,
-            "teddysun/xray"
-        ]
-        if node:
-            docker_cmd.insert(5, "--constraint")
-            docker_cmd.insert(6, f"node.hostname=={node}")
-
-        proc = subprocess.run(docker_cmd, capture_output=True)
-        if proc.returncode != 0:
-            print(f"❌ Не удалось создать сервис «{service_name}»")
-            print(proc.stderr.decode("utf-8"))
+        # 4) Создаём сервис
+        try:
+            create_service(username, port, node)
+        except Exception as e:
+            print(f"❌ Ошибка при создании сервиса: {e}")
             # Если сервис не создался, удалим созданный config и освободим порт
-            subprocess.run(["docker", "config", "rm", f"{CONFIG_NAME_PREFIX}-{username}"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run(["docker", "config", "rm", f"{CONFIG_NAME_PREFIX}-{username}"], 
+                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             release_port(port)
             sys.exit(1)
 
-        # 5) Собираем VLESS-ссылку для клиента с автоматическим определением IP
-        ip_or_domain = get_external_ip()
+        # 5) Определяем IP для VLESS-ссылки
+        if node:
+            # Если указана конкретная нода, пытаемся получить её IP
+            node_ip = get_node_ip(node)
+            ip_or_domain = node_ip if node_ip else get_external_ip()
+        else:
+            # Если нода не указана, используем общий IP
+            ip_or_domain = get_external_ip()
+        
         if not ip_or_domain:
             # Если IP не удалось получить, оставляем заглушку для ручной подстановки
             ip_or_domain = "<ВАШ_СТАТИЧНЫЙ_IP_ИЛИ_ДОМЕН>"
 
+        # 6) Собираем VLESS-ссылку для клиента
         vless_link = (
             f"vless://{uuid_str}@{ip_or_domain}:{port}"
             f"?security=reality&encryption=none&alpn=h2,http/1.1&headerType=none"
@@ -360,11 +375,12 @@ if __name__ == "__main__":
             f"&pbk={public_key}&sid={short_id}#{username}"
         )
         print("✅ Пользователь успешно добавлен.")
+        if node:
+            print(f"🎯 Сервис развёрнут на ноде: {node}")
         print("VLESS-ссылка для клиента:")
         print(vless_link)
 
     elif action == "remove":
-        # –– удаляем сервис, config и освобождаем порт (через метку)
         remove_user(username)
         cleanup_docker_system()
 
