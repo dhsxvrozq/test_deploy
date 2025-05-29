@@ -20,7 +20,7 @@ CONFIG_NAME_PREFIX = "vless-config"   # префикс для docker config: vle
 # Базовый домен или поддомен, под которым будут создаваться записи для пользователей.
 # Например, если BASE_DOMAIN = "example.com", то для пользователя "alice" будет "alice.example.com".
 # Можно задать через переменную окружения BASE_DOMAIN, иначе прописать прямо:
-BASE_DOMAIN = os.getenv("BASE_DOMAIN", "yourdomain.com")
+BASE_DOMAIN = os.getenv("BASE_DOMAIN", "4903923-pi05715.twc1.net")
 
 
 def get_next_port(start: int = 10000) -> int:
