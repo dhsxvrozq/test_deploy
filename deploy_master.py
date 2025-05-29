@@ -33,15 +33,7 @@ async def run_server(server_name: str) -> Optional[str]:
     #     return None
 
    
-twc server create \
---name cute-smew \
---type standard \
---preset-id 3340 \
---project-id 1497193 \
---image 95 \
---availability-zone ams-1 \
---region nl-1 \
---ssh_keys_ids 302543
+
 
     RUN_SERVER_CMD = f'twc server create \
             --name master-{server_name} \
