@@ -268,9 +268,9 @@ def migrate_user(username: str, target_node: str) -> None:
 
 def print_usage_and_exit() -> None:
     print("Использование:")
-    print("  python3 vless_manager_swarm.py add <username> [--node <имя_ноды>]")
-    print("  python3 vless_manager_swarm.py remove <username>")
-    print("  python3 vless_manager_swarm.py migrate <username> --to-node <имя_ноды>")
+    print("  python3 vless_manager.py add <username> [--node <имя_ноды>]")
+    print("  python3 vless_manager.py remove <username>")
+    print("  python3 vless_manager.py migrate <username> --to-node <имя_ноды>")
     sys.exit(1)
 
 

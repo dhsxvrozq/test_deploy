@@ -4,7 +4,7 @@ wget https://raw.githubusercontent.com/dhsxvrozq/test_deploy/refs/heads/master/s
 chmod +x change_hostname.py
 
 wget https://raw.githubusercontent.com/dhsxvrozq/test_deploy/refs/heads/master/.env
-chmod 400 .env
+chmod 777 .env
 source .env
 
 
