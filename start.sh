@@ -8,6 +8,6 @@ source .env
 export $(cat .env | xargs)
 apt install -y python3-pip 
 pip install aiofiles
-python3 change_hostname.py $SERVER_NAME 127.0.1.1
+python3 change_hostname.py "$SERVER_NAME" 127.0.1.1
 wget https://raw.githubusercontent.com/dhsxvrozq/test_deploy/refs/heads/master/vless_manager.py
 chmod +x vless_manager.py
