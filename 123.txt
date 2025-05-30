@@ -1,0 +1,5 @@
+wget https://raw.githubusercontent.com/dhsxvrozq/test_deploy/refs/heads/master/start.sh
+chmod +x start.sh
+./start.sh
+
+rm rm change_hostname.py start.sh vless_manager.py .env
