@@ -1,5 +1,5 @@
 #!/bin/sh
-apt update && apt upgrade
+apt update && apt upgrade -y
 wget https://raw.githubusercontent.com/dhsxvrozq/test_deploy/refs/heads/master/start.py/change_hostname.py
 chmod +x change_hostname.py
 wget https://raw.githubusercontent.com/dhsxvrozq/test_deploy/refs/heads/master/.env
